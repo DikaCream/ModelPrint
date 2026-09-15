@@ -1,0 +1,12 @@
+{
+  "model": "atlas-7b-instruct",
+  "gateway": "northwind-gateway",
+  "context_window": 32768,
+  "capability_document_version": 1,
+  "challenge": "capability-document-v1",
+  "answer": {
+    "route": "retry_with_backoff",
+    "confidence": 0.86
+  },
+  "notes": "Failed payments are retried three times with exponential backoff before the charge is abandoned."
+}

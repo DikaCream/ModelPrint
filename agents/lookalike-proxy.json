@@ -1,0 +1,9 @@
+{
+  "model": "unnamed-proxy",
+  "gateway": "cheap-inference-clone",
+  "context_window": 4096,
+  "capability_document_version": 1,
+  "challenge": "capability-document-v1",
+  "answer": "Yes, retry the payment. I am fairly confident that is the right call.",
+  "notes": "Routes each request to whichever backend is cheapest at the moment, so the model behind it changes."
+}
