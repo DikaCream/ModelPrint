@@ -34,6 +34,8 @@ export interface Attestation {
   disputed: boolean;
   disputeBond: bigint;
   disputeReason: string;
+  failedAttempts: number;
+  lastAttemptAt: number;
   createdAt: number;
   settledAt: number;
 }
@@ -44,6 +46,7 @@ export interface Stats {
   live: number;
   verified: number;
   falsified: number;
+  unreachable: number;
   bonds: bigint;
   paid: bigint;
 }
@@ -111,6 +114,8 @@ export function toAttestation(raw: any): Attestation {
     disputed: Boolean(raw?.disputed),
     disputeBond: toBig(raw?.dispute_bond),
     disputeReason: toStr(raw?.dispute_reason),
+    failedAttempts: toInt(raw?.failed_attempts),
+    lastAttemptAt: toInt(raw?.last_attempt_at),
     createdAt: toInt(raw?.created_at),
     settledAt: toInt(raw?.settled_at),
   };
@@ -123,6 +128,7 @@ export function toStats(raw: any): Stats {
     live: toInt(raw?.live),
     verified: toInt(raw?.verified),
     falsified: toInt(raw?.falsified),
+    unreachable: toInt(raw?.unreachable),
     bonds: toBig(raw?.bonds),
     paid: toBig(raw?.paid),
   };

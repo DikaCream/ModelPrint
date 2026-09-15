@@ -17,6 +17,15 @@ put money behind their accusation.
 The endpoint is pluggable: it is any URL that serves the agent's answer to the
 registered challenge, whether that is a static transcript, a hosted gateway, or
 a full inference API.
+
+A fetch that fails is not a verdict about the model, so it never settles a
+claim on its own. The failed attempt is recorded on chain and the claim waits
+out a cooldown before another audit may run, which keeps a burst of clicks from
+burning the retry budget while the endpoint is briefly down. Only when the
+retry budget is spent does the claim close, and it closes as UNREACHABLE with
+the same money flow as a failed claim. That last part is deliberate: a provider
+chooses the endpoint it bonds, so going dark must not be a cheaper exit than
+failing the requirements.
 """
 from genlayer import *
 from dataclasses import dataclass
@@ -28,6 +37,7 @@ LIVE = "LIVE"
 DISPUTED = "DISPUTED"
 VERIFIED = "VERIFIED"
 FALSIFIED = "FALSIFIED"
+UNREACHABLE = "UNREACHABLE"
 
 MATCHED = "MATCHED"
 MISMATCHED = "MISMATCHED"
@@ -37,6 +47,8 @@ GEN_ONE = 10 ** 18
 MIN_BOND = GEN_ONE // 200            # 0.005 GEN
 MAX_REASON_CHARS = 500
 MAX_PAGE_CHARS = 2500
+MAX_FETCH_ATTEMPTS = 3               # failed fetches allowed before a claim closes
+RETRY_COOLDOWN = 3600                # seconds between fetch retries
 
 MAX_LABEL = 120
 MAX_CRITERIA = 2000
@@ -81,6 +93,8 @@ class Attestation:
     disputed: bool
     dispute_bond: u256
     dispute_reason: str
+    failed_attempts: u256
+    last_attempt_at: u256
     created_at: u256
     settled_at: u256
 
@@ -96,6 +110,10 @@ class Attested(gl.Event):
 
 class Disputed(gl.Event):
     def __init__(self, attestation_id: u256, challenger: Address, bond: u256, /, **blob): ...
+
+
+class FetchAttemptFailed(gl.Event):
+    def __init__(self, attestation_id: u256, failed_attempts: u256, /, **blob): ...
 
 
 class Adjudicated(gl.Event):
@@ -228,6 +246,8 @@ class ModelPrint(gl.Contract):
             disputed=False,
             dispute_bond=u256(0),
             dispute_reason="",
+            failed_attempts=u256(0),
+            last_attempt_at=u256(0),
             created_at=u256(self._now()),
             settled_at=u256(0),
         )
@@ -271,6 +291,15 @@ class ModelPrint(gl.Contract):
         a = self._attestation(attestation_id)
         if a.status not in (LIVE, DISPUTED):
             raise gl.vm.UserError("this claim has already been adjudicated")
+        if int(a.failed_attempts) > 0:
+            # The endpoint was unreachable last time. Give the provider room to
+            # bring it back instead of letting anyone spend the retry budget in
+            # one sitting.
+            ready_at = int(a.last_attempt_at) + RETRY_COOLDOWN
+            if self._now() < ready_at:
+                raise gl.vm.UserError(
+                    "the endpoint was just unreachable, the retry window is still closed"
+                )
         p = self._profile(a.profile_id)
 
         endpoint_url = a.endpoint_url
@@ -283,7 +312,16 @@ class ModelPrint(gl.Contract):
                 page = gl.nondet.web.render(endpoint_url, mode="text")
                 page = str(page)[:MAX_PAGE_CHARS]
             except Exception:
-                page = "(the endpoint could not be fetched)"
+                # A failed fetch is evidence about the network, not about the
+                # model. Report it as its own outcome so no round can mistake it
+                # for a verdict on the endpoint's answer.
+                return json.dumps(
+                    {
+                        "verdict": UNREACHABLE,
+                        "reasoning": "The endpoint could not be fetched.",
+                    },
+                    sort_keys=True,
+                )
             page = _neutralize(page)
             prompt = (
                 f"You are auditing whether an endpoint really serves the model it "
@@ -323,10 +361,11 @@ class ModelPrint(gl.Contract):
 
         principle = (
             "Both answers audited the same endpoint against the same requirements. "
-            "They are equivalent if and only if both return the same verdict, either "
-            "MATCHED or MISMATCHED, and neither returns an error object. The "
-            "reasoning text may differ. Error objects are equivalent only to other "
-            "error objects."
+            "They are equivalent if and only if both report the same outcome. A "
+            "verdict is either MATCHED or MISMATCHED. UNREACHABLE means the "
+            "endpoint could not be fetched and is equivalent only to UNREACHABLE, "
+            "never to a verdict about the model. Error objects are equivalent "
+            "only to other error objects. The reasoning text may differ."
         )
 
         result = gl.eq_principle.prompt_comparative(do_audit, principle)
@@ -338,9 +377,32 @@ class ModelPrint(gl.Contract):
             raise gl.vm.UserError("the auditors returned unreadable output")
 
         verdict = str(verdict_data.get("verdict", "")).strip().upper()
-        if verdict not in (MATCHED, MISMATCHED):
+        if verdict not in (MATCHED, MISMATCHED, UNREACHABLE):
             raise gl.vm.UserError("the auditors returned no clear verdict")
         reasoning = str(verdict_data.get("reasoning", ""))[:MAX_REASON_CHARS]
+
+        if verdict == UNREACHABLE:
+            # Record the failed attempt and move no money. The claim stays open
+            # so the provider can fix the endpoint and anyone can try again.
+            a.failed_attempts = u256(int(a.failed_attempts) + 1)
+            a.last_attempt_at = u256(self._now())
+            FetchAttemptFailed(attestation_id, a.failed_attempts).emit()
+            if int(a.failed_attempts) < MAX_FETCH_ATTEMPTS:
+                return
+            # The retry budget is spent. An endpoint that never answers cannot
+            # support the claim, and closing here keeps the bonds from being
+            # locked forever. The money settles the way a failed claim does, so
+            # an impostor cannot escape its bond by going dark.
+            a.status = UNREACHABLE
+            a.verdict = UNREACHABLE
+            a.reasoning = reasoning
+            a.settled_at = u256(self._now())
+            taker = a.challenger if a.disputed else p.owner
+            self._release(taker, int(a.bond))
+            if a.disputed:
+                self._release(a.challenger, int(a.dispute_bond))
+            Adjudicated(attestation_id, UNREACHABLE).emit()
+            return
 
         a.verdict = verdict
         a.reasoning = reasoning
@@ -425,12 +487,15 @@ class ModelPrint(gl.Contract):
         live = 0
         verified = 0
         falsified = 0
+        unreachable = 0
         for i in range(1, int(self.next_attestation_id)):
             st = self.attestations[u256(i)].status
             if st in (LIVE, DISPUTED):
                 live += 1
             elif st == VERIFIED:
                 verified += 1
+            elif st == UNREACHABLE:
+                unreachable += 1
             else:
                 falsified += 1
         return {
@@ -439,6 +504,7 @@ class ModelPrint(gl.Contract):
             "live": live,
             "verified": verified,
             "falsified": falsified,
+            "unreachable": unreachable,
             "bonds": int(self.total_bonds),
             "paid": int(self.total_paid),
         }
@@ -459,6 +525,8 @@ class ModelPrint(gl.Contract):
             "disputed": a.disputed,
             "dispute_bond": int(a.dispute_bond),
             "dispute_reason": a.dispute_reason,
+            "failed_attempts": int(a.failed_attempts),
+            "last_attempt_at": int(a.last_attempt_at),
             "created_at": int(a.created_at),
             "settled_at": int(a.settled_at),
         }

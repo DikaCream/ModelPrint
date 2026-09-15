@@ -57,6 +57,12 @@ export function Board() {
           <span className="readout-label">Falsified</span>
           <span className="readout-value big bad">{stats.falsified}</span>
         </div>
+        {stats.unreachable > 0 && (
+          <div className="readout">
+            <span className="readout-label">Unreachable</span>
+            <span className="readout-value big">{stats.unreachable}</span>
+          </div>
+        )}
         <div className="readout">
           <span className="readout-label">Held in bonds</span>
           <span className="readout-value big">{formatGen(stats.bonds)}</span>

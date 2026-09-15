@@ -1,4 +1,4 @@
-export type Tone = "live" | "disputed" | "verified" | "falsified";
+export type Tone = "live" | "disputed" | "verified" | "falsified" | "unreachable";
 
 export function statusMeta(status: string): { tone: Tone; label: string; gloss: string } {
   switch (status) {
@@ -19,6 +19,13 @@ export function statusMeta(status: string): { tone: Tone; label: string; gloss: 
         tone: "falsified",
         label: "Falsified",
         gloss: "The validators fetched the endpoint and it failed the requirements.",
+      };
+    case "UNREACHABLE":
+      return {
+        tone: "unreachable",
+        label: "Unreachable",
+        gloss:
+          "Every audit failed to reach the endpoint, so the claim closed without a verdict about the model.",
       };
     default:
       return {

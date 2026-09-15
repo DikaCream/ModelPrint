@@ -19,6 +19,7 @@ const EMPTY_STATS: Stats = {
   live: 0,
   verified: 0,
   falsified: 0,
+  unreachable: 0,
   bonds: 0n,
   paid: 0n,
 };

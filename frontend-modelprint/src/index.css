@@ -23,6 +23,8 @@
   --amber-dim: rgba(229, 161, 58, 0.14);
   --red: #e0574a;
   --red-dim: rgba(224, 87, 74, 0.14);
+  --slate: #8593a1;
+  --slate-dim: rgba(133, 147, 161, 0.16);
 
   --display: "Chakra Petch", "Inter", system-ui, sans-serif;
   --body: "Inter", system-ui, -apple-system, sans-serif;
@@ -527,9 +529,19 @@ h4 {
   background: var(--red-dim);
 }
 
+/* Not a verdict about the model, so it gets no verdict colour. */
+.lamp.unreachable {
+  color: var(--slate);
+  background: var(--slate-dim);
+}
+
 i.lamp-dot.live {
   color: var(--teal);
   background: var(--teal);
+}
+i.lamp-dot.unreachable {
+  color: var(--slate);
+  background: var(--slate);
 }
 i.lamp-dot.verified {
   color: var(--green);
@@ -802,6 +814,11 @@ i.lamp-dot.falsified {
 .stamp-big.falsified {
   color: var(--red);
   background: var(--red-dim);
+}
+
+.stamp-big.unreachable {
+  color: var(--slate);
+  background: var(--slate-dim);
 }
 
 /* ------------------------------------------------------------------ form */

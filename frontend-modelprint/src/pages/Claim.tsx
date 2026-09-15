@@ -11,6 +11,12 @@ type Served =
   | { state: "ok"; text: string }
   | { state: "blocked" };
 
+// Mirrors the contract. Three failed fetches close a claim, one hour apart, so
+// a burst of clicks cannot spend the retry budget while an endpoint is down.
+const MAX_FETCH_ATTEMPTS = 3;
+const RETRY_COOLDOWN_S = 3600;
+const OPEN_STATUSES = ["LIVE", "DISPUTED"];
+
 export function ClaimPage() {
   const { id } = useParams();
   const cid = Number(id);
@@ -96,11 +102,20 @@ export function ClaimPage() {
   if (!claim) return null;
 
   const meta = statusMeta(claim.status);
-  const settled = claim.status === "VERIFIED" || claim.status === "FALSIFIED";
+  const settled = !OPEN_STATUSES.includes(claim.status);
   const mine = !!wallet.address &&
     wallet.address.toLowerCase() === claim.provider.toLowerCase();
   const canDispute = claim.status === "LIVE" && !claim.disputed && !mine;
-  const canAudit = !settled;
+
+  // A failed fetch is not a verdict: the claim stays open, so say why the next
+  // attempt has to wait instead of letting the button revert.
+  const nowS = Math.floor(Date.now() / 1000);
+  const retryReadyAt =
+    claim.failedAttempts > 0 ? claim.lastAttemptAt + RETRY_COOLDOWN_S : 0;
+  const cooling = !settled && retryReadyAt > nowS;
+  const minutesToRetry = cooling
+    ? Math.max(1, Math.ceil((retryReadyAt - nowS) / 60))
+    : 0;
 
   async function onAudit() {
     const ok = await run("audit", (c) => c.adjudicate(cid));
@@ -150,9 +165,13 @@ export function ClaimPage() {
         </div>
         <div className="claim-head-act">
           <StatusLamp status={claim.status} />
-          {canAudit && (
-            <button className="btn" onClick={onAudit} disabled={busy !== null}>
-              {busy === "audit" ? "Fetching and judging…" : "Run the audit"}
+          {!settled && (
+            <button className="btn" onClick={onAudit} disabled={busy !== null || cooling}>
+              {busy === "audit"
+                ? "Fetching and judging…"
+                : cooling
+                  ? `Retry opens in ${minutesToRetry}m`
+                  : "Run the audit"}
             </button>
           )}
         </div>
@@ -182,6 +201,19 @@ export function ClaimPage() {
       </section>
 
       <p className={`verdict-note ${meta.tone}`}>{meta.gloss}</p>
+
+      {!settled && claim.failedAttempts > 0 && (
+        <p className="action-note">
+          {claim.failedAttempts === 1
+            ? "One audit"
+            : `${claim.failedAttempts} audits`}{" "}
+          could not reach this endpoint. A failed fetch is not a verdict about the
+          model, so no bond moved and nothing was written as a verdict. The attempt
+          is recorded on the chain, and {MAX_FETCH_ATTEMPTS - claim.failedAttempts}{" "}
+          more before the claim closes as unreachable.
+          {cooling && ` The retry window reopens ${formatClock(retryReadyAt)}.`}
+        </p>
+      )}
 
       <section className="compare" aria-label="Evidence comparison">
         <article className="column ask">

@@ -34,6 +34,9 @@ MISS_CRITERIA = (
 
 CHALLENGE = "Return your machine readable capability document."
 
+# A reserved TLD, so this host cannot resolve and every validator fetch fails.
+DEAD_URL = "https://no-such-agent-endpoint-9f8a7b6c.invalid/capabilities"
+
 
 def _deploy(account):
     factory = get_contract_factory("ModelPrint")
@@ -153,3 +156,47 @@ def test_dispute_settles_both_bonds_once():
     stats = contract.get_stats(args=[]).call()
     assert int(stats["bonds"]) == 0, "a bond stayed locked after settlement"
     assert int(stats["paid"]) == 2 * BOND
+
+
+@pytest.mark.integration
+def test_a_failed_fetch_does_not_settle_the_claim():
+    """An unreachable endpoint must never become a verdict.
+
+    The validators really attempt this host and really fail, which is the only
+    honest way to prove the behaviour end to end: the round records the attempt
+    and moves no money.
+    """
+    accounts = get_accounts()
+    owner, provider = accounts[0], accounts[1]
+    contract = _deploy(account=owner)
+
+    pid = _register(contract, "atlas-7b-instruct", MATCH_CRITERIA)
+    aid = _attest(contract, provider, pid, "gone-gateway", DEAD_URL)
+
+    receipt = contract.adjudicate(args=[aid]).transact(
+        wait_interval=10000, wait_retries=40
+    )
+    assert tx_execution_succeeded(receipt)
+
+    claim = contract.get_attestation(args=[aid]).call()
+    assert claim["status"] == "LIVE", "a failed fetch settled the claim"
+    assert claim["verdict"] == "", "a failed fetch was written as a verdict"
+    assert int(claim["failed_attempts"]) == 1
+    assert int(claim["last_attempt_at"]) > 0
+    assert int(claim["settled_at"]) == 0
+
+    stats = contract.get_stats(args=[]).call()
+    assert int(stats["bonds"]) == BOND, "the bond moved on a failed fetch"
+    assert int(stats["paid"]) == 0
+    assert int(stats["falsified"]) == 0
+    assert int(stats["verified"]) == 0
+    assert int(stats["unreachable"]) == 0
+
+    # The retry window is real: the next attempt cannot run immediately.
+    receipt = contract.adjudicate(args=[aid]).transact(
+        wait_interval=10000, wait_retries=15
+    )
+    assert not tx_execution_succeeded(receipt)
+    after = contract.get_attestation(args=[aid]).call()
+    assert int(after["failed_attempts"]) == 1, "the retry window let a second run through"
+    assert int(contract.get_stats(args=[]).call()["paid"]) == 0

@@ -6,10 +6,17 @@ through the comparative equivalence principle before anything is written.
 These tests mock the fetch and the auditor, then prove the contract's own
 guarantees: a claim is adjudicated once, a malformed or unclear verdict moves
 no money, and every bond is released exactly once to exactly one side.
+
+The section on failed fetches is the one worth reading first: an endpoint that
+cannot be reached is not a verdict about the model. Those tests prove the failed
+round moves no money, that a burst of attempts cannot spend the retry budget,
+and that a claim only closes once the attempts are spent and the endpoint stayed
+dark.
 """
+import datetime
 import json
 
-from tests.direct.conftest import to_hex
+from tests.direct.conftest import iso_to_ts, set_time, to_hex
 
 GEN = 10 ** 18
 BOND = GEN // 100          # 0.01 GEN
@@ -47,6 +54,16 @@ def must_revert(fn):
     try:
         fn()
     except Exception:
+        return
+    assert False, "expected this call to revert"
+
+
+def must_revert_with(fn, needle: str):
+    """Revert for the stated reason, not for some other accident."""
+    try:
+        fn()
+    except Exception as e:
+        assert needle in str(e), f"expected {needle!r} in {e!r}"
         return
     assert False, "expected this call to revert"
 
@@ -459,6 +476,211 @@ def test_the_fetched_page_cannot_forge_the_fence(
     contract.adjudicate(aid)
 
     assert contract.get_attestation(aid)["status"] == "FALSIFIED"
+
+
+# ============================================ a failed fetch is not a verdict
+CLOCK = "2030-03-01T00:00:00Z"
+COOLDOWN = 3600
+
+
+def _at(seconds_after_clock: int) -> str:
+    """An ISO timestamp the contract can read, offset from CLOCK."""
+    moment = datetime.datetime.fromtimestamp(
+        iso_to_ts(CLOCK) + seconds_after_clock, datetime.timezone.utc
+    )
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _dark_claim(direct_vm, direct_deploy, direct_alice, direct_bob, pid=None):
+    """A live claim whose endpoint no mock answers, so every fetch fails."""
+    contract = direct_deploy("contracts/model_print.py")
+    if pid is None:
+        pid = _register(contract, direct_vm, direct_alice)
+    aid = _attest(contract, direct_vm, direct_bob, pid, url="https://nowhere.example.com/gone")
+    return contract, aid
+
+
+def test_a_failed_fetch_does_not_settle_the_claim(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """The endpoint is unreachable, so nothing about the model was proven.
+
+    Status, verdict, and both bond buckets must come out exactly as they went
+    in, with the attempt recorded instead of a verdict.
+    """
+    contract, aid = _dark_claim(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    set_time(CLOCK)
+    contract.adjudicate(aid)
+
+    a = contract.get_attestation(aid)
+    assert a["status"] == "LIVE"
+    assert a["verdict"] == ""
+    assert a["reasoning"] == ""
+    assert int(a["failed_attempts"]) == 1
+    assert int(a["last_attempt_at"]) == iso_to_ts(CLOCK)
+    assert int(a["settled_at"]) == 0
+
+    stats = contract.get_stats()
+    assert stats["bonds"] == BOND
+    assert stats["paid"] == 0
+    assert stats["falsified"] == 0
+    assert stats["unreachable"] == 0
+    assert stats["verified"] == 0
+
+
+def test_a_failed_fetch_keeps_a_dispute_open(
+    direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie
+):
+    contract, aid = _dark_claim(direct_vm, direct_deploy, direct_alice, direct_bob)
+    _dispute(contract, direct_vm, direct_charlie, aid)
+
+    set_time(CLOCK)
+    contract.adjudicate(aid)
+
+    a = contract.get_attestation(aid)
+    assert a["status"] == "DISPUTED"
+    assert a["disputed"] is True
+    assert int(a["failed_attempts"]) == 1
+
+    stats = contract.get_stats()
+    assert stats["bonds"] == 2 * BOND
+    assert stats["paid"] == 0
+
+
+def test_a_second_attempt_is_blocked_until_the_cooldown_passes(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """One caller must not be able to spend the retry budget in one sitting."""
+    contract, aid = _dark_claim(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    set_time(CLOCK)
+    contract.adjudicate(aid)
+
+    must_revert_with(
+        lambda: contract.adjudicate(aid), "the retry window is still closed"
+    )
+    assert int(contract.get_attestation(aid)["failed_attempts"]) == 1
+
+    # One second short of the cooldown is still too soon.
+    set_time(_at(COOLDOWN - 1))
+    must_revert_with(
+        lambda: contract.adjudicate(aid), "the retry window is still closed"
+    )
+
+    # At the cooldown boundary the retry runs again.
+    set_time(_at(COOLDOWN))
+    contract.adjudicate(aid)
+    assert int(contract.get_attestation(aid)["failed_attempts"]) == 2
+
+
+def test_a_recovered_endpoint_still_verifies(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """A transient outage must not cost the provider its claim."""
+    contract, aid = _dark_claim(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    set_time(CLOCK)
+    contract.adjudicate(aid)
+    assert contract.get_attestation(aid)["status"] == "LIVE"
+
+    set_time(_at(COOLDOWN))
+    _audit(direct_vm, verdict="MATCHED", page=GOOD_PAGE, url=r".*nowhere\.example\.com.*")
+    contract.adjudicate(aid)
+
+    a = contract.get_attestation(aid)
+    assert a["status"] == "VERIFIED"
+    assert a["verdict"] == "MATCHED"
+    assert int(a["failed_attempts"]) == 1      # the failed round stays on record
+
+    stats = contract.get_stats()
+    assert stats["verified"] == 1
+    assert stats["unreachable"] == 0
+    assert stats["bonds"] == 0
+    assert stats["paid"] == BOND
+
+
+def test_the_retry_budget_closes_the_claim_as_unreachable(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """Three dark rounds close the claim, and it closes as unreachable."""
+    contract, aid = _dark_claim(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    set_time(CLOCK)
+    contract.adjudicate(aid)
+    set_time(_at(COOLDOWN))
+    contract.adjudicate(aid)
+
+    a = contract.get_attestation(aid)
+    assert a["status"] == "LIVE"
+    assert int(a["failed_attempts"]) == 2
+    assert contract.get_stats()["paid"] == 0
+
+    set_time(_at(2 * COOLDOWN))
+    contract.adjudicate(aid)
+
+    a = contract.get_attestation(aid)
+    assert a["status"] == "UNREACHABLE"
+    assert a["verdict"] == "UNREACHABLE"
+    assert len(a["reasoning"]) > 0
+    assert int(a["failed_attempts"]) == 3
+    assert int(a["settled_at"]) > 0
+
+    stats = contract.get_stats()
+    assert stats["unreachable"] == 1
+    assert stats["falsified"] == 0          # it never became a verdict about the model
+    assert stats["bonds"] == 0
+    assert stats["paid"] == BOND            # no challenger, so the model owner takes it
+
+    # A closed claim is closed, and the fifth click cannot move anything.
+    set_time(_at(5 * COOLDOWN))
+    must_revert_with(
+        lambda: contract.adjudicate(aid), "already been adjudicated"
+    )
+    stats = contract.get_stats()
+    assert stats["bonds"] == 0
+    assert stats["paid"] == BOND
+
+
+def test_going_dark_is_not_a_cheaper_exit_than_failing(
+    direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie
+):
+    """An impostor cannot take its endpoint offline and keep the bond."""
+    contract, aid = _dark_claim(direct_vm, direct_deploy, direct_alice, direct_bob)
+    _dispute(contract, direct_vm, direct_charlie, aid)
+
+    set_time(CLOCK)
+    contract.adjudicate(aid)
+    set_time(_at(COOLDOWN))
+    contract.adjudicate(aid)
+    set_time(_at(2 * COOLDOWN))
+    contract.adjudicate(aid)
+
+    a = contract.get_attestation(aid)
+    assert a["status"] == "UNREACHABLE"
+    stats = contract.get_stats()
+    assert stats["bonds"] == 0
+    assert stats["paid"] == 2 * BOND      # the challenger takes both, as on a failed claim
+
+
+def test_a_verdict_does_not_spend_the_retry_budget(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """Reaching the endpoint and failing the requirements is a different path."""
+    contract = direct_deploy("contracts/model_print.py")
+    pid = _register(contract, direct_vm, direct_alice)
+    aid = _attest(contract, direct_vm, direct_bob, pid)
+
+    set_time(CLOCK)
+    _audit(direct_vm, verdict="MISMATCHED", page=BAD_PAGE)
+    contract.adjudicate(aid)
+
+    a = contract.get_attestation(aid)
+    assert a["status"] == "FALSIFIED"
+    assert a["verdict"] == "MISMATCHED"
+    assert int(a["failed_attempts"]) == 0
+    assert contract.get_stats()["unreachable"] == 0
+    assert contract.get_stats()["falsified"] == 1
 
 
 # =================================================================== views

@@ -35,6 +35,21 @@ against it, and pay the person who proves an impostor.
    the same bytes, and the round only stands when they agree on the verdict. The
    reasoning is written to the chain next to the verdict.
 
+### When the endpoint cannot be reached
+
+A fetch that fails is evidence about the network, not about the model, so it
+never settles a claim on its own. The round records the attempt and stops there:
+status unchanged, no verdict written, every bond exactly where it was. The claim
+then waits one hour before another audit may run, which keeps a burst of clicks
+from spending the retry budget while an endpoint is briefly down.
+
+After three dark rounds the claim closes as `UNREACHABLE` and the money settles
+the way a failed claim does. That is deliberate. A provider chooses the endpoint
+it bonds, so going dark must not be a cheaper exit than failing the
+requirements. What the record keeps is the difference: an unreachable claim is
+never counted as a verdict about the model, and the failed attempts stay visible
+on chain.
+
 ### What the contract refuses
 
 - A verdict written by a caller. There is no path in the contract that sets one.
@@ -45,6 +60,9 @@ against it, and pay the person who proves an impostor.
 - A provider disputing itself, or a claim being contested twice.
 - A verdict that is malformed, or not exactly `MATCHED` or `MISMATCHED`. Both
   revert with every bond still held.
+- A failed fetch settling anything. It is recorded as an attempt, and the claim
+  stays open.
+- A second audit inside the retry window, and a fourth attempt ever.
 - An endpoint talking its way to a verdict. The fetched page is fenced as
   untrusted input and its fence markers are stripped, so it cannot close the
   quote early or paste a fake result.
@@ -119,10 +137,17 @@ Two layers:
   the dispute guards, both settlement directions with and without a challenger,
   the prompt-injection handling, and the rejection proofs: a claim audited once,
   malformed output, a missing verdict field, and an unclear verdict all revert
-  with the bonds untouched. 33 tests.
+  with the bonds untouched. The failed-fetch section is the part to read first:
+  it proves a dark round moves no money, that the retry window blocks a second
+  attempt until the hour is up and reopens at the boundary, that a recovered
+  endpoint still verifies with the failed attempt on record, that three dark
+  rounds close the claim as unreachable, and that an impostor cannot escape its
+  bond by taking the endpoint offline. 40 tests.
 - **Integration** (`tests/integration/test_model_print.py`) deploys to StudioNet
   and exercises the real consensus path, with the validators fetching public
-  URLs and agreeing on the verdict.
+  URLs and agreeing on the verdict. A third test points a claim at a host that
+  cannot resolve, so the validators really fail to reach it, and asserts that
+  the claim stayed open with no bond moved.
 
 ```bash
 # direct (fast, no network)
