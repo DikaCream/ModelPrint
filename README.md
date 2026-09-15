@@ -84,16 +84,18 @@ impostor caught without a challenger funds the model it was mimicking.
 | | |
 |---|---|
 | Network | GenLayer StudioNet |
-| Contract | [`0x8A7A308e6c86BF4a54940d8978BA2331789a31a1`](https://explorer-studio.genlayer.com/address/0x8A7A308e6c86BF4a54940d8978BA2331789a31a1) |
+| Contract | [`0xa15A57979E0206Ac589C6a2661A47472cD5E5c9B`](https://explorer-studio.genlayer.com/address/0xa15A57979E0206Ac589C6a2661A47472cD5E5c9B) |
 | Contract source | [`contracts/model_print.py`](contracts/model_print.py) |
-| Live state | 2 profiles, 5 claims, 1 verified, 2 falsified, 2 still standing, 0.03 GEN in bonds, 0.04 GEN paid out |
+| Live state | 2 profiles, 6 claims, 1 verified, 2 falsified, 3 still standing, 0.04 GEN in bonds, 0.04 GEN paid out |
 
 The board shows the whole lifecycle. Claim 1 served the real document and was
 verified. Claim 2 served someone else's and was falsified, and because nobody
 contested it the bond went to the model owner. Claim 3 was an impostor that
-someone did contest, so both bonds went to the accuser. Claims 4 and 5 are still
-open: 4 is an honest gateway standing on its bond, 5 is an impostor under dispute
-waiting for anyone to press the button.
+someone did contest, so both bonds went to the accuser. Claim 4 is an honest
+gateway standing on its bond, claim 5 is an impostor under dispute waiting for
+anyone to press the button, and claim 6 is the failed-fetch case: its host does
+not resolve, one audit has already been recorded against it, and nothing moved.
+Open claim 6 to see the retry window on a live contract.
 
 ## The demo endpoints
 
