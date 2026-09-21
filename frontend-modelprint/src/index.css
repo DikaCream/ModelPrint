@@ -1021,3 +1021,58 @@ i.lamp-dot.falsified {
     display: none;
   }
 }
+
+/* ----------------------------------------------------------------- v2 lamp */
+.lamp.stale {
+  color: var(--red);
+  background: var(--red-dim);
+  border-style: dashed;
+}
+
+i.lamp-dot.stale {
+  color: var(--red);
+  background: var(--red);
+}
+
+.lamp.retired {
+  color: var(--slate);
+  background: var(--slate-dim);
+  border-style: dashed;
+}
+
+i.lamp-dot.retired {
+  color: var(--slate);
+  background: var(--slate);
+}
+
+/* ------------------------------------------------------------- nonce panel */
+.nonce-panel .nonce-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  align-items: stretch;
+  margin-top: 14px;
+}
+
+.nonce-panel .nonce-box {
+  flex: 1 1 320px;
+  min-width: 0;
+  border: 1px dashed rgba(133, 147, 161, 0.4);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.nonce-panel .nonce-value {
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  word-break: break-all;
+}
+
+.nonce-panel .nonce-act {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: center;
+}

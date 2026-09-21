@@ -1,7 +1,7 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useModelPrint } from "../context/ModelPrintContext";
-import { Attestation, Profile } from "../lib/types";
+import { Attestation, Freshness, Profile } from "../lib/types";
 import { describeError } from "../lib/errors";
 import { formatClock, formatGen, hostOf, shortAddr, EXPLORER_ADDR } from "../config";
 import { StatusLamp, statusMeta } from "../components/StatusLamp";
@@ -17,6 +17,16 @@ const MAX_FETCH_ATTEMPTS = 3;
 const RETRY_COOLDOWN_S = 3600;
 const OPEN_STATUSES = ["LIVE", "DISPUTED"];
 
+function freshnessLine(f: Freshness): string {
+  const s = Math.max(0, f.secondsLeft);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h left`;
+  if (h > 0) return `${h}h ${m}m left`;
+  return `${m}m ${s % 60}s left`;
+}
+
 export function ClaimPage() {
   const { id } = useParams();
   const cid = Number(id);
@@ -29,6 +39,8 @@ export function ClaimPage() {
   const [err, setErr] = useState<string | null>(null);
   const [reason, setReason] = useState("");
   const [formMsg, setFormMsg] = useState<string | null>(null);
+  const [fresh, setFresh] = useState<Freshness | null>(null);
+  const [nextNonce, setNextNonce] = useState<string>("");
 
   const load = useCallback(async () => {
     if (!Number.isFinite(cid) || cid < 1) {
@@ -48,6 +60,16 @@ export function ClaimPage() {
       setClaim(a);
       setProfile(p);
       setErr(null);
+      if (a.status === "VERIFIED") {
+        setFresh(await read.getFreshness(cid));
+      } else {
+        setFresh(null);
+      }
+      if (a.status === "LIVE" || a.status === "VERIFIED") {
+        setNextNonce(await read.getAuditNonce(cid));
+      } else {
+        setNextNonce("");
+      }
     } catch (e) {
       setErr(describeError(e));
     } finally {
@@ -125,6 +147,32 @@ export function ClaimPage() {
     }
   }
 
+  async function onReserveAndAudit() {
+    const ok = await run("reserve", (c) => c.reserveAuditNonce(cid));
+    if (ok) {
+      await load();
+      setFormMsg(
+        "Nonce pinned and shown above. Write the answer for it on the endpoint, then run the audit.",
+      );
+    }
+  }
+
+  async function onRenew() {
+    const ok = await run("renew", (c) => c.reaudit(cid));
+    if (ok) {
+      await load();
+      setFormMsg("New audit passed, the proof is fresh again.");
+    }
+  }
+
+  async function onRetire() {
+    const ok = await run("retire", (c) => c.retire(cid));
+    if (ok) {
+      await load();
+      setFormMsg("Claim retired and the bond is back in your wallet.");
+    }
+  }
+
   async function onDispute(ev: FormEvent) {
     ev.preventDefault();
     setFormMsg(null);
@@ -171,7 +219,19 @@ export function ClaimPage() {
                 ? "Fetching and judging…"
                 : cooling
                   ? `Retry opens in ${minutesToRetry}m`
-                  : "Run the audit"}
+                  : claim.status === "VERIFIED"
+                    ? "Run the renewal audit"
+                    : "Run the audit"}
+            </button>
+          )}
+          {mine && (claim.status === "LIVE" || claim.status === "VERIFIED") && (
+            <button
+              className="btn ghost"
+              onClick={onRetire}
+              disabled={busy !== null}
+              title="End the claim and take the bond back"
+            >
+              {busy === "retire" ? "Retiring…" : "Retire"}
             </button>
           )}
         </div>
@@ -198,7 +258,70 @@ export function ClaimPage() {
             {claim.settledAt ? formatClock(claim.settledAt) : "open"}
           </span>
         </div>
+        {claim.auditedAt > 0 && (
+          <div className="readout">
+            <span className="readout-label">Proof audits</span>
+            <span className="readout-value">{claim.auditCount}</span>
+          </div>
+        )}
       </section>
+
+      {claim.status === "VERIFIED" && fresh && (
+        <p className="action-note">
+          Proof is fresh: {freshnessLine(fresh)}, until {formatClock(fresh.expiresAt)}. A
+          standing claim only counts while someone can still dispute it, so the endpoint
+          has to keep answering new audits before the window runs out.
+        </p>
+      )}
+
+      {(claim.status === "LIVE" || claim.status === "VERIFIED") && (
+        <section className="panel nonce-panel">
+          <header className="panel-head">
+            <h2>{claim.status === "VERIFIED" ? "Renew the proof" : "The audit handshake"}</h2>
+            <p className="panel-note">
+              {claim.status === "VERIFIED"
+                ? "Reserve the next nonce, answer it on the endpoint, then run the renewal audit before the window closes."
+                : "Reserve the nonce, write the answer for it on the endpoint, then run the audit. A page written before the nonce existed proves nothing, so the handshake is what makes the verdict honest."}
+            </p>
+          </header>
+          <div className="nonce-row">
+            <div className="nonce-box">
+              <span className="readout-label">Next audit nonce</span>
+              <code className="mono nonce-value">{nextNonce || "not reserved yet"}</code>
+            </div>
+            <div className="nonce-act">
+              <button className="btn ghost" onClick={onReserveAndAudit} disabled={busy !== null}>
+                {busy === "reserve"
+                  ? "Reserving…"
+                  : nextNonce
+                    ? "Refresh nonce"
+                    : claim.status === "VERIFIED"
+                      ? "Reserve for renewal"
+                      : "Reserve nonce"}
+              </button>
+              {nextNonce && (
+                <button
+                  className="btn"
+                  onClick={claim.status === "VERIFIED" ? onRenew : onAudit}
+                  disabled={busy !== null}
+                >
+                  {busy === "audit" || busy === "renew"
+                    ? "Fetching and judging…"
+                    : claim.status === "VERIFIED"
+                      ? "Run the renewal audit"
+                      : "Run the audit"}
+                </button>
+              )}
+            </div>
+          </div>
+          <p className="column-foot">
+            The provider writes the answer for this exact nonce onto the endpoint. The
+            validators fetch the page, and the contract rejects any answer that does not
+            carry the nonce, so a frozen page from an earlier audit cannot stand in for a
+            live one.
+          </p>
+        </section>
+      )}
 
       <p className={`verdict-note ${meta.tone}`}>{meta.gloss}</p>
 

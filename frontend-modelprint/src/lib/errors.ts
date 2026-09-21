@@ -62,6 +62,18 @@ export function describeError(e: unknown): string {
   if (lower.includes("reason: 1-2000")) return "The reason must be 1 to 2000 characters.";
   if (lower.includes("already been adjudicated"))
     return "This claim has already been audited. A verdict is written once.";
+  if (lower.includes("not awaiting a first verdict"))
+    return "This claim is not waiting for a first audit.";
+  if (lower.includes("only a verified claim can be re-audited"))
+    return "Only a verified claim can be re-audited. Settle it first.";
+  if (lower.includes("freshness window has closed"))
+    return "The freshness window has closed. Attest again with a new bond to reopen the claim.";
+  if (lower.includes("only the provider can retire"))
+    return "Only the provider can retire this claim.";
+  if (lower.includes("only a live or verified claim can be retired"))
+    return "Only a live or verified claim can be retired. This one is already closed.";
+  if (lower.includes("nonce"))
+    return "The endpoint did not answer this audit's nonce, so the proof is rejected. The provider must write the answer for the current nonce shown on this page, then run the audit again.";
   if (lower.includes("retry window is still closed"))
     return "The endpoint was unreachable on the last audit. Wait for the retry window to reopen, then try again.";
   if (lower.includes("no clear verdict"))

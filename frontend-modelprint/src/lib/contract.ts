@@ -1,13 +1,16 @@
 import { CONTRACT_ADDRESS } from "../config";
 import {
   Attestation,
+  Freshness,
   Profile,
   ProfileSummary,
   Stats,
   toAttestation,
+  toFreshness,
   toProfile,
   toProfileSummary,
   toStats,
+  toStr,
 } from "./types";
 
 export class ModelPrint {
@@ -101,5 +104,30 @@ export class ModelPrint {
   /** Fetch the endpoint on the validators and let them agree on the verdict. */
   async adjudicate(id: number): Promise<string> {
     return this.write("adjudicate", [id]);
+  }
+
+  /** Pin the next audit nonce so the endpoint can answer it before the round. */
+  async reserveAuditNonce(id: number): Promise<string> {
+    return this.write("reserve_audit_nonce", [id]);
+  }
+
+  /** The nonce this claim's next audit will check, reserved or derived. */
+  async getAuditNonce(id: number): Promise<string> {
+    return toStr(await this.read("audit_nonce", [id]));
+  }
+
+  /** Whether a verified claim is still inside its freshness window. */
+  async getFreshness(id: number): Promise<Freshness> {
+    return toFreshness(await this.read("get_freshness", [id]));
+  }
+
+  /** Run a new audit of a verified claim to renew its proof. */
+  async reaudit(id: number): Promise<string> {
+    return this.write("reaudit", [id]);
+  }
+
+  /** End the claim and take the bond back. */
+  async retire(id: number): Promise<string> {
+    return this.write("retire", [id]);
   }
 }

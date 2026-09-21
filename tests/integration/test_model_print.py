@@ -9,6 +9,9 @@ purpose, so nothing about the result depends on this machine. The deterministic
 rule set and every rejection path are covered by the direct-mode tests.
 """
 
+import json
+import urllib.request
+
 import pytest
 from gltest import get_accounts, get_contract_factory
 from gltest.assertions import tx_execution_succeeded
@@ -20,22 +23,67 @@ BOND = GEN // 100
 MATCH_URL = "https://httpbin.org/json"
 MISS_URL = "https://example.com"
 
+# A correct capability answer names the model, answers the challenge, and
+# carries the audit nonce. The nonce can only be known at audit time, so the
+# document has to be written after the nonce is reserved on-chain; the echo
+# test below creates such an endpoint per run.
 MATCH_CRITERIA = (
     "The response must be a JSON object. It must contain a field named "
-    "\"slideshow\" whose value is an object with a string field \"title\" and an "
-    "array field \"slides\" that is not empty. HTML, plain prose, or a missing "
-    "\"slideshow\" field counts as a failure."
+    "\"model\" whose value is a non-empty string, a field named "
+    "\"challenge_response\" whose value is a non-empty string, and the audit "
+    "nonce from this prompt must appear somewhere in the document. HTML, plain "
+    "prose, or a document missing the nonce counts as a failure."
 )
 MISS_CRITERIA = (
     "The response must be a JSON object. It must contain a field named "
-    "\"slideshow\" whose value is an object with a string field \"title\". HTML or "
-    "plain prose counts as a failure."
+    "\"model\" whose value is a non-empty string and a field named "
+    "\"challenge_response\" whose value is a non-empty string. HTML or plain "
+    "prose counts as a failure."
 )
 
 CHALLENGE = "Return your machine readable capability document."
 
 # A reserved TLD, so this host cannot resolve and every validator fetch fails.
 DEAD_URL = "https://no-such-agent-endpoint-9f8a7b6c.invalid/capabilities"
+
+
+def _new_webhook_url() -> str:
+    """Create an empty document slot on a public host whose content can be
+    rewritten through its API, and return its URL."""
+    req = urllib.request.Request(
+        "https://webhook.site/token",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    token = json.loads(urllib.request.urlopen(req, timeout=30).read())["uuid"]
+    return f"https://webhook.site/{token}"
+
+
+def _write_echo_document(url: str, nonce: str) -> None:
+    """Write the capability answer for one exact nonce.
+
+    The document names the model, answers the challenge, and carries the
+    nonce. It did not exist before the nonce did, which is the property the
+    whole audit stands on.
+    """
+    body = json.dumps(
+        {
+            "model": "atlas-7b-instruct",
+            "challenge_response": CHALLENGE,
+            "audit_nonce": nonce,
+        }
+    )
+    token = url.rsplit("/", 1)[1]
+    req = urllib.request.Request(
+        f"https://webhook.site/token/{token}",
+        data=json.dumps({"default_content": body, "status": 200}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="PUT",
+    )
+    urllib.request.urlopen(req, timeout=30)
+    served = urllib.request.urlopen(url, timeout=30).read().decode()
+    assert nonce in served, "the echo endpoint did not take the nonce"
 
 
 def _deploy(account):
@@ -99,8 +147,14 @@ def test_register_attest_adjudicate_lifecycle():
     assert int(settled["settled_at"]) > 0
 
     stats = contract.get_stats(args=[]).call()
-    assert int(stats["bonds"]) == 0, "the bond was not released"
-    assert int(stats["paid"]) == BOND
+    if settled["status"] == "VERIFIED":
+        # A standing claim keeps its bond escrowed so it can always be
+        # disputed while it is live; only falsified claims release it.
+        assert int(stats["bonds"]) == BOND
+        assert int(stats["paid"]) == 0
+    else:
+        assert int(stats["bonds"]) == 0
+        assert int(stats["paid"]) == BOND
     assert int(stats["verified"]) + int(stats["falsified"]) == 1
 
     # A claim is adjudicated exactly once.
@@ -110,7 +164,93 @@ def test_register_attest_adjudicate_lifecycle():
     assert not tx_execution_succeeded(receipt)
     after = contract.get_attestation(args=[aid]).call()
     assert after["status"] == settled["status"]
-    assert int(contract.get_stats(args=[]).call()["paid"]) == BOND
+
+
+@pytest.mark.integration
+def test_freshness_reaudit_and_retire():
+    """The v2 proof lifecycle on the live network.
+
+    A verified claim carries a nonce and an expiry, re-auditing renews the
+    proof with a new nonce, and retiring releases the bond to the provider.
+    """
+    accounts = get_accounts()
+    owner, provider = accounts[0], accounts[1]
+    contract = _deploy(account=owner)
+
+    pid = _register(contract, "atlas-7b-instruct", MATCH_CRITERIA)
+    # The webhook token is created first so the URL exists at attest time, but
+    # its content is written only after the nonce is reserved on-chain: the
+    # page that exists before the nonce proves nothing.
+    echo_url = _new_webhook_url()
+    aid = _attest(contract, provider, pid, "gateway-a", echo_url)
+
+    receipt = (
+        contract.connect(provider)
+        .reserve_audit_nonce(args=[aid])
+        .transact(wait_interval=10000, wait_retries=15)
+    )
+    assert tx_execution_succeeded(receipt)
+    nonce = str(contract.audit_nonce(args=[aid]).call())
+    assert len(nonce) == 32
+    _write_echo_document(echo_url, nonce)
+
+    receipt = contract.adjudicate(args=[aid]).transact(
+        wait_interval=10000, wait_retries=40
+    )
+    assert tx_execution_succeeded(receipt)
+    claim = contract.get_attestation(args=[aid]).call()
+    if claim["status"] != "VERIFIED":
+        print(
+            f"\n[freshness-probe] verdict: {claim['verdict']}, reasoning: {str(claim['reasoning'])[:300]}"
+        )
+        pytest.skip(
+            "validators judged the live endpoint as not matching; "
+            "the freshness path needs a verified claim"
+        )
+
+    print(f"\n[freshness-probe] settled verdict: {claim['verdict']}, reasoning: {str(claim['reasoning'])[:200]}")
+    fresh = contract.get_freshness(args=[aid]).call()
+    assert fresh["is_fresh"] is True
+    assert len(str(claim["audit_nonce"])) == 32
+
+    # Re-audit renews the proof: a new nonce, a later timestamp, same bond.
+    # The new nonce is reserved first and the document is rewritten to answer
+    # it, the same maintenance a real provider does before every renewal.
+    receipt = (
+        contract.connect(provider)
+        .reserve_audit_nonce(args=[aid])
+        .transact(wait_interval=10000, wait_retries=15)
+    )
+    assert tx_execution_succeeded(receipt)
+    new_nonce = str(contract.audit_nonce(args=[aid]).call())
+    assert len(new_nonce) == 32 and new_nonce != nonce
+    _write_echo_document(echo_url, new_nonce)
+
+    receipt = (
+        contract.connect(provider)
+        .reaudit(args=[aid])
+        .transact(wait_interval=10000, wait_retries=40)
+    )
+    assert tx_execution_succeeded(receipt)
+    renewed = contract.get_attestation(args=[aid]).call()
+    assert renewed["status"] == "VERIFIED"
+    assert int(renewed["audit_count"]) == int(claim["audit_count"]) + 1
+    assert int(renewed["audited_at"]) > int(claim["audited_at"])
+    assert renewed["audit_nonce"] != claim["audit_nonce"]
+    assert contract.get_freshness(args=[aid]).call()["is_fresh"] is True
+    assert int(contract.get_stats(args=[]).call()["bonds"]) == BOND
+
+    # Retire: the provider steps away and takes the bond home.
+    receipt = (
+        contract.connect(provider)
+        .retire(args=[aid])
+        .transact(wait_interval=10000, wait_retries=15)
+    )
+    assert tx_execution_succeeded(receipt)
+    retired = contract.get_attestation(args=[aid]).call()
+    assert retired["status"] == "RETIRED"
+    assert contract.get_freshness(args=[aid]).call()["is_fresh"] is False
+    assert int(contract.get_stats(args=[]).call()["bonds"]) == 0
 
 
 @pytest.mark.integration
@@ -154,8 +294,14 @@ def test_dispute_settles_both_bonds_once():
     assert settled["status"] in ("VERIFIED", "FALSIFIED")
 
     stats = contract.get_stats(args=[]).call()
-    assert int(stats["bonds"]) == 0, "a bond stayed locked after settlement"
-    assert int(stats["paid"]) == 2 * BOND
+    settled_status = contract.get_attestation(args=[aid]).call()["status"]
+    if settled_status == "VERIFIED":
+        # The claim bond stays escrowed; the dispute bond went home.
+        assert int(stats["bonds"]) == BOND
+        assert int(stats["paid"]) == BOND
+    else:
+        assert int(stats["bonds"]) == 0, "a bond stayed locked after settlement"
+        assert int(stats["paid"]) == 2 * BOND
 
 
 @pytest.mark.integration

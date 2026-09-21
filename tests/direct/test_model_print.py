@@ -7,11 +7,25 @@ These tests mock the fetch and the auditor, then prove the contract's own
 guarantees: a claim is adjudicated once, a malformed or unclear verdict moves
 no money, and every bond is released exactly once to exactly one side.
 
+Every audit runs against a fresh nonce the contract draws itself, and the
+endpoint is required to answer the challenge for that nonce and echo it back.
+The mock auditor does the same thing a real one would: it reads the nonce out
+of the prompt and echoes it. A claimed answer that does not echo the nonce is
+a page from the past, and those tests prove it falsifies the claim rather than
+verifying it.
+
 The section on failed fetches is the one worth reading first: an endpoint that
 cannot be reached is not a verdict about the model. Those tests prove the failed
 round moves no money, that a burst of attempts cannot spend the retry budget,
 and that a claim only closes once the attempts are spent and the endpoint stayed
 dark.
+
+Freshness is the other half. A verified claim carries the moment of the audit
+that proved it and goes stale after a week, the bond stays escrowed while the
+claim stands, and the provider renews by re-auditing with a new nonce or leaves
+by retiring. Those tests prove the money follows the story: nothing is paid out
+on a verdict, a wrong accusation still costs the challenger, and retirement is
+the provider's own door out.
 """
 import datetime
 import json
@@ -21,6 +35,7 @@ from tests.direct.conftest import iso_to_ts, set_time, to_hex
 GEN = 10 ** 18
 BOND = GEN // 100          # 0.01 GEN
 MIN_BOND = GEN // 200      # 0.005 GEN
+FRESHNESS_WINDOW = 7 * 86400  # matches the contract's proof lifetime
 
 GOOD_URL = "https://agents.example.com/atlas-7b"
 BAD_URL = "https://agents.example.com/lookalike"
@@ -81,6 +96,14 @@ def _attest(contract, vm, provider, pid, url=GOOD_URL, bond=BOND, label="gateway
     return aid
 
 
+def _alive_claim(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """A plain undisputed claim that has not been audited yet."""
+    contract = direct_deploy("contracts/model_print.py")
+    pid = _register(contract, direct_vm, direct_alice)
+    aid = _attest(contract, direct_vm, direct_bob, pid)
+    return contract, aid
+
+
 def _dispute(contract, vm, who, aid, bond=BOND, reason="It answered like a proxy."):
     vm.sender = who
     vm.value = bond
@@ -88,9 +111,24 @@ def _dispute(contract, vm, who, aid, bond=BOND, reason="It answered like a proxy
     vm.value = 0
 
 
-def _audit(vm, verdict="MATCHED", reason="Matches the registered requirements.", page=GOOD_PAGE, url=r".*agents\.example\.com.*"):
+def _audit(contract, vm, attestation_id, verdict="MATCHED", reason="Matches the registered requirements.", page=GOOD_PAGE, url=r".*agents\.example\.com.*", echo=True):
+    """Mock one audit round the way the real protocol runs.
+
+    The endpoint answers the challenge for a nonce that exists before the audit
+    runs and the validators check the echo against the nonce the contract
+    burned into the record. The mock draws a nonce, stages its echo in the
+    response, and the audit consumes the same reserved nonce, so a matched
+    verdict only lands when the echoes line up. ``echo=False`` stages the
+    attack the protocol exists to catch: an answer that was not produced for
+    this audit, which has to falsify regardless of its content.
+    """
     vm.mock_web(url, {"status": 200, "body": page})
-    vm.mock_llm(AUDIT_PROMPT, json.dumps({"verdict": verdict, "reasoning": reason}))
+    nonce = contract.reserve_audit_nonce(attestation_id)
+    echoed = nonce if echo else "0000000000000000"
+    vm.mock_llm(
+        AUDIT_PROMPT,
+        json.dumps({"verdict": verdict, "nonce": echoed, "reasoning": reason}),
+    )
 
 
 # ======================================================== register a profile
@@ -263,37 +301,55 @@ def test_adjudicate_matched_verifies_and_returns_the_bond(
     pid = _register(contract, direct_vm, direct_alice)
     aid = _attest(contract, direct_vm, direct_bob, pid)
 
-    _audit(direct_vm, verdict="MATCHED", page=GOOD_PAGE)
+    _audit(contract, direct_vm, aid, verdict="MATCHED", page=GOOD_PAGE)
     contract.adjudicate(aid)
 
     a = contract.get_attestation(aid)
     assert a["status"] == "VERIFIED"
     assert a["verdict"] == "MATCHED"
     assert len(a["reasoning"]) > 0
-    assert int(a["settled_at"]) > 0
+    # The claim now carries the freshness proof: when it was audited, for which
+    # nonce, and how long it stays verified.
+    assert int(a["audited_at"]) > 0
+    assert len(a["audit_nonce"]) == 32
+    assert int(a["audit_count"]) == 1
+    assert int(a["fresh_until"]) == int(a["audited_at"]) + 7 * 86400
+    assert a["is_fresh"] is True
+    # The bond stays escrowed with the standing claim, so it can always be
+    # disputed while it is live.
     stats = contract.get_stats()
     assert stats["verified"] == 1
-    assert stats["bonds"] == 0
-    assert stats["paid"] == BOND
+    assert stats["bonds"] == BOND
+    assert stats["paid"] == 0
+
+    # The freshness view agrees with the record.
+    f = contract.get_freshness(aid)
+    assert f["is_fresh"] is True
+    assert f["verified_effective"] is True
+    assert int(f["expires_at"]) == int(a["fresh_until"])
 
 
 def test_adjudicate_matched_makes_the_challenger_pay(
     direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie
 ):
-    """A wrong accusation costs the challenger its bond."""
+    """A wrong accusation costs the challenger its dispute bond."""
     contract = direct_deploy("contracts/model_print.py")
     pid = _register(contract, direct_vm, direct_alice)
     aid = _attest(contract, direct_vm, direct_bob, pid, bond=BOND)
     _dispute(contract, direct_vm, direct_charlie, aid, bond=BOND)
 
-    _audit(direct_vm, verdict="MATCHED")
+    _audit(contract, direct_vm, aid, verdict="MATCHED")
     contract.adjudicate(aid)
 
     a = contract.get_attestation(aid)
     assert a["status"] == "VERIFIED"
+    # The claim bond stays escrowed; the dispute bond went back to the provider
+    # as the price of a wrong accusation.
     stats = contract.get_stats()
-    assert stats["bonds"] == 0
-    assert stats["paid"] == 2 * BOND          # both bonds went to the provider
+    assert stats["bonds"] == BOND
+    assert stats["paid"] == BOND
+    assert a["disputed"] is False
+    assert int(a["dispute_bond"]) == 0
 
 
 def test_adjudicate_by_a_stranger_still_uses_the_validator_verdict(
@@ -304,7 +360,7 @@ def test_adjudicate_by_a_stranger_still_uses_the_validator_verdict(
     aid = _attest(contract, direct_vm, direct_bob, pid)
 
     direct_vm.sender = direct_charlie
-    _audit(direct_vm, verdict="MISMATCHED", page=BAD_PAGE, reason="Wrong schema.")
+    _audit(contract, direct_vm, aid, verdict="MISMATCHED", page=BAD_PAGE, reason="Wrong schema.")
     contract.adjudicate(aid)
 
     assert contract.get_attestation(aid)["verdict"] == "MISMATCHED"
@@ -319,7 +375,7 @@ def test_adjudicate_falsified_pays_the_model_owner_when_undisputed(
     pid = _register(contract, direct_vm, direct_alice)
     aid = _attest(contract, direct_vm, direct_bob, pid)
 
-    _audit(direct_vm, verdict="MISMATCHED", page=BAD_PAGE, reason="Declares 4096, not 32768.")
+    _audit(contract, direct_vm, aid, verdict="MISMATCHED", page=BAD_PAGE, reason="Declares 4096, not 32768.")
     contract.adjudicate(aid)
 
     a = contract.get_attestation(aid)
@@ -330,6 +386,9 @@ def test_adjudicate_falsified_pays_the_model_owner_when_undisputed(
     assert stats["bonds"] == 0
     assert stats["paid"] == BOND
 
+    # A settled claim has no freshness to speak of.
+    assert contract.get_freshness(aid)["is_fresh"] is False
+
 
 def test_adjudicate_falsified_pays_the_challenger(
     direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie
@@ -339,7 +398,7 @@ def test_adjudicate_falsified_pays_the_challenger(
     aid = _attest(contract, direct_vm, direct_bob, pid, bond=BOND)
     _dispute(contract, direct_vm, direct_charlie, aid, bond=BOND)
 
-    _audit(direct_vm, verdict="MISMATCHED", page=BAD_PAGE)
+    _audit(contract, direct_vm, aid, verdict="MISMATCHED", page=BAD_PAGE)
     contract.adjudicate(aid)
 
     a = contract.get_attestation(aid)
@@ -357,12 +416,12 @@ def test_adjudicate_is_one_time(
     aid = _attest(contract, direct_vm, direct_bob, pid)
     _dispute(contract, direct_vm, direct_charlie, aid)
 
-    _audit(direct_vm, verdict="MISMATCHED", page=BAD_PAGE)
+    _audit(contract, direct_vm, aid, verdict="MISMATCHED", page=BAD_PAGE)
     contract.adjudicate(aid)
     paid_before = contract.get_stats()["paid"]
 
     direct_vm.clear_mocks()
-    _audit(direct_vm, verdict="MATCHED", page=GOOD_PAGE)
+    _audit(contract, direct_vm, aid, verdict="MATCHED", page=GOOD_PAGE)
     must_revert(lambda: contract.adjudicate(aid))
 
     stats = contract.get_stats()
@@ -397,7 +456,7 @@ def test_adjudicate_reverts_on_an_unclear_verdict(
     pid = _register(contract, direct_vm, direct_alice)
     aid = _attest(contract, direct_vm, direct_bob, pid)
 
-    _audit(direct_vm, verdict="PROBABLY")
+    _audit(contract, direct_vm, aid, verdict="PROBABLY")
     must_revert(lambda: contract.adjudicate(aid))
 
     assert contract.get_attestation(aid)["status"] == "LIVE"
@@ -585,7 +644,7 @@ def test_a_recovered_endpoint_still_verifies(
     assert contract.get_attestation(aid)["status"] == "LIVE"
 
     set_time(_at(COOLDOWN))
-    _audit(direct_vm, verdict="MATCHED", page=GOOD_PAGE, url=r".*nowhere\.example\.com.*")
+    _audit(contract, direct_vm, aid, verdict="MATCHED", page=GOOD_PAGE, url=r".*nowhere\.example\.com.*")
     contract.adjudicate(aid)
 
     a = contract.get_attestation(aid)
@@ -596,8 +655,8 @@ def test_a_recovered_endpoint_still_verifies(
     stats = contract.get_stats()
     assert stats["verified"] == 1
     assert stats["unreachable"] == 0
-    assert stats["bonds"] == 0
-    assert stats["paid"] == BOND
+    assert stats["bonds"] == BOND
+    assert stats["paid"] == 0
 
 
 def test_the_retry_budget_closes_the_claim_as_unreachable(
@@ -635,7 +694,7 @@ def test_the_retry_budget_closes_the_claim_as_unreachable(
     # A closed claim is closed, and the fifth click cannot move anything.
     set_time(_at(5 * COOLDOWN))
     must_revert_with(
-        lambda: contract.adjudicate(aid), "already been adjudicated"
+        lambda: contract.adjudicate(aid), "not awaiting a first verdict"
     )
     stats = contract.get_stats()
     assert stats["bonds"] == 0
@@ -672,7 +731,7 @@ def test_a_verdict_does_not_spend_the_retry_budget(
     aid = _attest(contract, direct_vm, direct_bob, pid)
 
     set_time(CLOCK)
-    _audit(direct_vm, verdict="MISMATCHED", page=BAD_PAGE)
+    _audit(contract, direct_vm, aid, verdict="MISMATCHED", page=BAD_PAGE)
     contract.adjudicate(aid)
 
     a = contract.get_attestation(aid)
@@ -697,7 +756,7 @@ def test_list_attestations_and_filter(
     assert listed[0]["id"] == a1
     assert listed[1]["id"] == a2
 
-    _audit(direct_vm, verdict="MISMATCHED", page=BAD_PAGE)
+    _audit(contract, direct_vm, a2, verdict="MISMATCHED", page=BAD_PAGE)
     contract.adjudicate(a2)
 
     assert len(contract.list_attestations(0, 10, "LIVE")) == 1
@@ -726,10 +785,10 @@ def test_stats_track_every_state(
     good = _attest(contract, direct_vm, direct_charlie, pid2, label="gateway-c")
     bad = _attest(contract, direct_vm, direct_bob, pid1, label="gateway-d")
 
-    _audit(direct_vm, verdict="MISMATCHED", page=BAD_PAGE)
+    _audit(contract, direct_vm, bad, verdict="MISMATCHED", page=BAD_PAGE)
     contract.adjudicate(bad)
     direct_vm.clear_mocks()
-    _audit(direct_vm, verdict="MATCHED")
+    _audit(contract, direct_vm, good, verdict="MATCHED")
     contract.adjudicate(good)
 
     stats = contract.get_stats()
@@ -738,6 +797,144 @@ def test_stats_track_every_state(
     assert stats["live"] == 1          # `live` is the undisputed one still open
     assert stats["verified"] == 1
     assert stats["falsified"] == 1
-    assert stats["bonds"] == BOND      # only the open claim still holds a bond
-    assert stats["paid"] == 2 * BOND
+    assert stats["bonds"] == 2 * BOND  # the open claim and the verified one
+    assert stats["paid"] == BOND       # the wrong accusation's dispute bond
     assert contract.get_attestation(live)["status"] == "LIVE"
+
+
+# ============================================ freshness: nonce, window, retire
+def test_an_answer_without_the_nonce_falsifies_the_claim(
+    direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie
+):
+    """A page from the past proves nothing about the endpoint now.
+
+    The endpoint serves a perfect answer for an audit that never happened.
+    The claim bond moves to the challenger and the ledger reflects a settled,
+    falsified claim.
+    """
+    contract, aid = _alive_claim(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    _audit(contract, direct_vm, aid, verdict="MATCHED", echo=False)
+    contract.adjudicate(aid)
+
+    a = contract.get_attestation(aid)
+    assert a["status"] == "FALSIFIED"
+    assert "did not echo" in a["reasoning"]
+
+    stats = contract.get_stats()
+    assert stats["falsified"] == 1
+    assert stats["bonds"] == 0
+    assert stats["paid"] == BOND
+
+
+def test_a_verified_claim_goes_stale_after_the_window(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """Proof expires: a week-old audit counts for nothing, storage aside."""
+    contract, aid = _alive_claim(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    set_time(CLOCK)
+    _audit(contract, direct_vm, aid, verdict="MATCHED")
+    contract.adjudicate(aid)
+    assert contract.get_freshness(aid)["is_fresh"] is True
+
+    # One second past the window, the same VERIFIED record is no longer proof.
+    set_time(_at(FRESHNESS_WINDOW + 1))
+    f = contract.get_freshness(aid)
+    assert f["is_fresh"] is False
+    assert f["verified_effective"] is False
+    assert int(f["expires_at"]) == iso_to_ts(CLOCK) + FRESHNESS_WINDOW
+    assert contract.get_attestation(aid)["status"] == "VERIFIED"
+
+    # The stale claim keeps its bond escrowed so it can still be disputed.
+    stats = contract.get_stats()
+    assert stats["bonds"] == BOND
+    assert stats["paid"] == 0
+
+
+def test_reaudit_renews_freshness_with_a_new_nonce(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """A provider who keeps answering keeps the claim alive."""
+    contract, aid = _alive_claim(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    set_time(CLOCK)
+    _audit(contract, direct_vm, aid, verdict="MATCHED")
+    contract.adjudicate(aid)
+    first = contract.get_attestation(aid)
+
+    set_time(_at(FRESHNESS_WINDOW - 3600))
+    direct_vm.clear_mocks()
+    _audit(contract, direct_vm, aid, verdict="MATCHED")
+    contract.reaudit(aid)
+
+    a = contract.get_attestation(aid)
+    assert a["status"] == "VERIFIED"
+    assert int(a["audit_count"]) == 2
+    assert int(a["audited_at"]) == iso_to_ts(_at(FRESHNESS_WINDOW - 3600))
+    assert int(a["audited_at"]) > int(first["audited_at"])
+    assert a["audit_nonce"] != first["audit_nonce"]
+    assert contract.get_freshness(aid)["is_fresh"] is True
+
+    stats = contract.get_stats()
+    assert stats["bonds"] == BOND          # still escrowed, still disputable
+    assert stats["paid"] == 0
+
+
+def test_reaudit_reverts_outside_the_window_and_on_other_states(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """Re-audit is a renewal, not a resurrection."""
+    contract, aid = _alive_claim(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    # A LIVE claim has no audit to renew.
+    must_revert_with(lambda: contract.reaudit(aid), "only a verified claim")
+
+    set_time(CLOCK)
+    _audit(contract, direct_vm, aid, verdict="MATCHED")
+    contract.adjudicate(aid)
+
+    # Far outside the window, renewal must be refused outright.
+    set_time(_at(FRESHNESS_WINDOW + 2 * 86400))
+    must_revert_with(lambda: contract.reaudit(aid), "freshness window")
+
+
+def test_retire_returns_the_bond_and_ends_the_claim(
+    direct_vm, direct_deploy, direct_alice, direct_bob, direct_charlie
+):
+    """A provider can always step away; a retired claim proves nothing."""
+    contract, aid = _alive_claim(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    _audit(contract, direct_vm, aid, verdict="MATCHED")
+    contract.adjudicate(aid)
+
+    direct_vm.sender = direct_charlie
+    must_revert_with(lambda: contract.retire(aid), "only the provider")
+
+    set_time(_at(3600))
+    direct_vm.sender = direct_bob
+    contract.retire(aid)
+
+    a = contract.get_attestation(aid)
+    assert a["status"] == "RETIRED"
+    assert int(a["settled_at"]) == iso_to_ts(_at(3600))
+    assert contract.get_freshness(aid)["is_fresh"] is False
+
+    stats = contract.get_stats()
+    assert stats["bonds"] == 0
+    assert stats["paid"] == BOND
+    assert contract.get_attestation(aid)["status"] == "RETIRED"
+
+
+def test_retire_reverts_for_a_stranger_and_on_a_settled_claim(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    """Retirement is the provider's exit, not anyone's tool."""
+    contract, aid = _alive_claim(direct_vm, direct_deploy, direct_alice, direct_bob)
+
+    _audit(contract, direct_vm, aid, verdict="MISMATCHED", page=BAD_PAGE)
+    contract.adjudicate(aid)
+    assert contract.get_attestation(aid)["status"] == "FALSIFIED"
+
+    direct_vm.sender = direct_bob
+    must_revert_with(lambda: contract.retire(aid), "only a live or verified claim")

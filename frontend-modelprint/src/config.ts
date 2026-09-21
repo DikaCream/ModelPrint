@@ -6,7 +6,7 @@ export const RPC_URL = (import.meta.env.VITE_RPC_URL as string) || "";
 /** Deployed ModelPrint contract on GenLayer StudioNet. */
 export const CONTRACT_ADDRESS =
   (import.meta.env.VITE_CONTRACT_ADDRESS as string) ||
-  "0xa15A57979E0206Ac589C6a2661A47472cD5E5c9B";
+  "0x3a35aF7755808F9f0EEbE148a86114b8363f8CC7";
 
 export const STUDIONET_CHAIN_ID = 777;
 export const STUDIONET_CHAIN_ID_HEX = "0x309";

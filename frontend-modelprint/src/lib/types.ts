@@ -38,6 +38,9 @@ export interface Attestation {
   lastAttemptAt: number;
   createdAt: number;
   settledAt: number;
+  auditNonce: string;
+  auditCount: number;
+  auditedAt: number;
 }
 
 export interface Stats {
@@ -49,6 +52,12 @@ export interface Stats {
   unreachable: number;
   bonds: bigint;
   paid: bigint;
+}
+
+export interface Freshness {
+  isFresh: boolean;
+  expiresAt: number;
+  secondsLeft: number;
 }
 
 export function toInt(v: unknown, fallback = 0): number {
@@ -118,6 +127,9 @@ export function toAttestation(raw: any): Attestation {
     lastAttemptAt: toInt(raw?.last_attempt_at),
     createdAt: toInt(raw?.created_at),
     settledAt: toInt(raw?.settled_at),
+    auditNonce: toStr(raw?.audit_nonce),
+    auditCount: toInt(raw?.audit_count),
+    auditedAt: toInt(raw?.audited_at),
   };
 }
 
@@ -131,5 +143,13 @@ export function toStats(raw: any): Stats {
     unreachable: toInt(raw?.unreachable),
     bonds: toBig(raw?.bonds),
     paid: toBig(raw?.paid),
+  };
+}
+
+export function toFreshness(raw: any): Freshness {
+  return {
+    isFresh: Boolean(raw?.is_fresh),
+    expiresAt: toInt(raw?.expires_at),
+    secondsLeft: toInt(raw?.seconds_left),
   };
 }
